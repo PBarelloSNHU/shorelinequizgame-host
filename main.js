@@ -80,8 +80,14 @@ function subscribeToSession() {
         })
 
         await api.tryAdvanceIfExpired(sessionId)
+
+        const freshSession = await api.fetchSession(sessionId)
+        if (freshSession.status !== session.status) {
+          session = freshSession
+          await resyncSessionState()
+        }
       } catch (err) {
-        console.warn('[host] tryAdvanceIfExpired failed:', err)
+        console.warn('[host] expiry poll failed:', err)
       }
     }, 1000)
   }
@@ -204,13 +210,7 @@ function render() {
       renderLobby(app, {
         joinCode,
         roster,
-        onStart: async () => {
-          try {
-            await api.startQuestion(sessionId)
-          } catch (err) {
-            console.error('[host] startQuestion failed:', err)
-          }
-        },
+        onStart: handleStartQuestion,
       })
       break
 
@@ -225,6 +225,7 @@ function render() {
         onLockNow: async () => {
           try {
             await api.revealQuestion(sessionId)
+            await resyncSessionState()
           } catch (err) {
             console.error('[host] revealQuestion failed:', err)
           }
@@ -244,6 +245,7 @@ function render() {
         onNext: async () => {
           try {
             await api.advanceQuestion(sessionId)
+            await resyncSessionState()
           } catch (err) {
             console.error('[host] advanceQuestion failed:', err)
           }
@@ -260,6 +262,31 @@ function render() {
 
     default:
       console.warn('[host] unknown session status:', session.status)
+  }
+}
+
+async function handleStartQuestion() {
+  try {
+    await api.startQuestion(sessionId)
+
+    // Optimistic fast-path for the host so the question/timer appears
+    // immediately instead of waiting on realtime delivery.
+    session = await api.fetchSession(sessionId)
+
+    if (session.status === 'question_live') {
+      currentQuestion = await api.fetchCurrentQuestion(sessionId)
+      answeredCount = await api.fetchAnsweredCount(
+        sessionId,
+        session.current_question_index
+      )
+    }
+
+    render()
+
+    // Follow with a full resync so roster/derived state stay canonical.
+    await resyncSessionState()
+  } catch (err) {
+    console.error('[host] startQuestion failed:', err)
   }
 }
 
