@@ -63,6 +63,8 @@ function subscribeToSession() {
     onPresenceSync: () => {},
   })
 
+  // Runs every second while question_live, so auto-lock at 0s is driven
+  // by the backend (try_advance_if_expired), not by manual clicks.
   if (!expiryPoll) {
     expiryPoll = setInterval(() => {
       if (session?.status === 'question_live') {
@@ -78,20 +80,36 @@ async function handleBroadcast(payload) {
   const table = payload.table
 
   if (table === 'quiz_sessions') {
+    // Always resync derived state when the session row changes,
+    // including when try_advance_if_expired flips status to 'reveal'.
     session = payload.record
-    await resyncSessionState()
+    try {
+      await resyncSessionState()
+    } catch (err) {
+      console.error('Resync after quiz_sessions broadcast failed:', err)
+    }
     return
   }
 
+  if (!sessionId) return
+
   if (table === 'quiz_players') {
-    roster = await api.fetchRoster(sessionId)
-    render()
+    try {
+      roster = await api.fetchRoster(sessionId)
+      render()
+    } catch (err) {
+      console.warn('Failed to refresh roster:', err)
+    }
     return
   }
 
   if (table === 'quiz_scores') {
-    scoreboard = await api.fetchScoreboard(sessionId)
-    render()
+    try {
+      scoreboard = await api.fetchScoreboard(sessionId)
+      render()
+    } catch (err) {
+      console.warn('Failed to refresh scoreboard:', err)
+    }
     return
   }
 
@@ -113,6 +131,7 @@ async function resyncSessionState() {
   if (resyncPromise) return resyncPromise
 
   resyncPromise = (async () => {
+    // Always start from the latest session row.
     session = await api.fetchSession(sessionId)
     roster = await api.fetchRoster(sessionId)
 
@@ -169,6 +188,8 @@ function render() {
         session,
         answeredCount,
         rosterCount: roster.length,
+        // Manual lock remains as a safety fallback; auto-lock is handled
+        // by tryAdvanceIfExpired + broadcast/resync.
         onLockNow: async () => {
           await api.revealQuestion(sessionId)
         },
@@ -236,6 +257,8 @@ function resetToSetup() {
   renderSetup(app, { onCreate: handleCreate })
 }
 
+// Resilience net: if a broadcast is missed for any reason, re-sync when
+// the tab becomes active again.
 window.addEventListener('focus', () => {
   if (sessionId) {
     resyncSessionState().catch((err) => {
