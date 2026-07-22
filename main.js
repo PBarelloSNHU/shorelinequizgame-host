@@ -42,15 +42,20 @@ async function boot() {
 }
 
 async function handleCreate({ level, count, timer }) {
-  const created = await api.createSession({ level, count, timer })
-  sessionId = created.session_id
-  joinCode = created.join_code
+  try {
+    const created = await api.createSession({ level, count, timer })
+    sessionId = created.session_id
+    joinCode = created.join_code
 
-  localStorage.setItem('tq357_host_session_id', sessionId)
-  localStorage.setItem('tq357_host_join_code', joinCode)
+    localStorage.setItem('tq357_host_session_id', sessionId)
+    localStorage.setItem('tq357_host_join_code', joinCode)
 
-  subscribeToSession()
-  await resyncSessionState()
+    subscribeToSession()
+    await resyncSessionState()
+  } catch (err) {
+    console.error('Failed to create host session:', err)
+    resetToSetup()
+  }
 }
 
 function subscribeToSession() {
@@ -63,30 +68,42 @@ function subscribeToSession() {
     onPresenceSync: () => {},
   })
 
-  // Runs every second while question_live, so auto-lock at 0s is driven
-  // by the backend (try_advance_if_expired), not by manual clicks.
   if (!expiryPoll) {
-    expiryPoll = setInterval(() => {
-      if (session?.status === 'question_live') {
-        api.tryAdvanceIfExpired(sessionId).catch((err) => {
-          console.warn('tryAdvanceIfExpired failed:', err)
+    expiryPoll = setInterval(async () => {
+      if (session?.status !== 'question_live') return
+
+      try {
+        console.log('[host] tryAdvanceIfExpired tick', {
+          sessionId,
+          status: session.status,
+          current_question_index: session.current_question_index,
         })
+
+        await api.tryAdvanceIfExpired(sessionId)
+      } catch (err) {
+        console.warn('[host] tryAdvanceIfExpired failed:', err)
       }
     }, 1000)
   }
 }
 
 async function handleBroadcast(payload) {
-  const table = payload.table
+  console.log(
+    '[host] broadcast received:',
+    payload?.table,
+    payload?.record?.status,
+    payload
+  )
+
+  const table = payload?.table
 
   if (table === 'quiz_sessions') {
-    // Always resync derived state when the session row changes,
-    // including when try_advance_if_expired flips status to 'reveal'.
     session = payload.record
+
     try {
       await resyncSessionState()
     } catch (err) {
-      console.error('Resync after quiz_sessions broadcast failed:', err)
+      console.error('[host] resync after quiz_sessions broadcast failed:', err)
     }
     return
   }
@@ -98,7 +115,7 @@ async function handleBroadcast(payload) {
       roster = await api.fetchRoster(sessionId)
       render()
     } catch (err) {
-      console.warn('Failed to refresh roster:', err)
+      console.warn('[host] failed to refresh roster:', err)
     }
     return
   }
@@ -108,7 +125,7 @@ async function handleBroadcast(payload) {
       scoreboard = await api.fetchScoreboard(sessionId)
       render()
     } catch (err) {
-      console.warn('Failed to refresh scoreboard:', err)
+      console.warn('[host] failed to refresh scoreboard:', err)
     }
     return
   }
@@ -121,7 +138,7 @@ async function handleBroadcast(payload) {
       )
       render()
     } catch (err) {
-      console.warn('Failed to refresh answered count:', err)
+      console.warn('[host] failed to refresh answered count:', err)
     }
   }
 }
@@ -131,9 +148,11 @@ async function resyncSessionState() {
   if (resyncPromise) return resyncPromise
 
   resyncPromise = (async () => {
-    // Always start from the latest session row.
-    session = await api.fetchSession(sessionId)
-    roster = await api.fetchRoster(sessionId)
+    const freshSession = await api.fetchSession(sessionId)
+    const freshRoster = await api.fetchRoster(sessionId)
+
+    session = freshSession
+    roster = freshRoster
 
     currentQuestion = null
     revealedQuestion = null
@@ -154,6 +173,14 @@ async function resyncSessionState() {
       scoreboard = await api.fetchScoreboard(sessionId)
     }
 
+    console.log('[host] resynced session state:', {
+      status: session.status,
+      rosterCount: roster.length,
+      answeredCount,
+      currentQuestionIndex: session.current_question_index,
+      scoreboardCount: scoreboard.length,
+    })
+
     render()
   })()
 
@@ -170,34 +197,44 @@ function render() {
     return
   }
 
+  console.log('[host] render status:', session.status)
+
   switch (session.status) {
     case 'lobby':
       renderLobby(app, {
         joinCode,
         roster,
         onStart: async () => {
-          await api.startQuestion(sessionId)
+          try {
+            await api.startQuestion(sessionId)
+          } catch (err) {
+            console.error('[host] startQuestion failed:', err)
+          }
         },
       })
       break
 
     case 'question_live':
       if (!currentQuestion) return
+
       renderQuestionLive(app, {
         question: currentQuestion,
         session,
         answeredCount,
         rosterCount: roster.length,
-        // Manual lock remains as a safety fallback; auto-lock is handled
-        // by tryAdvanceIfExpired + broadcast/resync.
         onLockNow: async () => {
-          await api.revealQuestion(sessionId)
+          try {
+            await api.revealQuestion(sessionId)
+          } catch (err) {
+            console.error('[host] revealQuestion failed:', err)
+          }
         },
       })
       break
 
     case 'reveal':
       if (!revealedQuestion) return
+
       renderReveal(app, {
         question: revealedQuestion,
         correctIndex: revealedQuestion.correct_index,
@@ -205,7 +242,11 @@ function render() {
         isLastQuestion:
           session.current_question_index + 1 >= session.question_count,
         onNext: async () => {
-          await api.advanceQuestion(sessionId)
+          try {
+            await api.advanceQuestion(sessionId)
+          } catch (err) {
+            console.error('[host] advanceQuestion failed:', err)
+          }
         },
       })
       break
@@ -218,7 +259,7 @@ function render() {
       break
 
     default:
-      console.warn('Unknown session status:', session.status)
+      console.warn('[host] unknown session status:', session.status)
   }
 }
 
@@ -257,12 +298,10 @@ function resetToSetup() {
   renderSetup(app, { onCreate: handleCreate })
 }
 
-// Resilience net: if a broadcast is missed for any reason, re-sync when
-// the tab becomes active again.
 window.addEventListener('focus', () => {
   if (sessionId) {
     resyncSessionState().catch((err) => {
-      console.error('Host focus resync failed:', err)
+      console.error('[host] focus resync failed:', err)
     })
   }
 })
@@ -270,7 +309,7 @@ window.addEventListener('focus', () => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && sessionId) {
     resyncSessionState().catch((err) => {
-      console.error('Host visibility resync failed:', err)
+      console.error('[host] visibility resync failed:', err)
     })
   }
 })
