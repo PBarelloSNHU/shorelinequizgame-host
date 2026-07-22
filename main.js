@@ -109,18 +109,18 @@ function render() {
         })
       })
       break
-    case 'reveal':
-      renderReveal(app, {
-        question: revealed,
-        correctIndex: revealed.correct_index,
-        scoreboard,
-        isLastQuestion: session.current_question_index + 1 >= session.question_count,
-	onNext: async () => {
-  		if (session.status !== 'reveal') return
-  		await api.advanceQuestion(sessionId)
-	}
-      })
-      break
+case 'reveal':
+  renderReveal(app, {
+    question: revealed,
+    correctIndex: revealed.correct_index,
+    scoreboard,
+    isLastQuestion: session.current_question_index + 1 >= session.question_count,
+    onNext: async () => {
+      if (session.status !== 'reveal') return
+      await api.advanceQuestion(sessionId)
+    },
+  })
+  break
     case 'ended':
       renderGameOver(app, { scoreboard, onNewSession: handleNewSession })
       break
