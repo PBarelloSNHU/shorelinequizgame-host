@@ -138,4 +138,48 @@ function handleNewSession() {
   renderSetup(app, { onCreate: handleCreate })
 }
 
+async function resyncSessionState() {
+  if (!sessionId) return
+
+  session = await api.fetchSession(sessionId)
+  roster = await api.fetchRoster(sessionId)
+
+  if (session.status === 'question_live') {
+    answeredCount = await api.fetchAnsweredCount(sessionId, session.current_question_index)
+    revealed = null
+  } else if (session.status === 'reveal') {
+    revealed = await api.fetchRevealedQuestion(sessionId)
+    scoreboard = await api.fetchScoreboard(sessionId)
+  } else if (session.status === 'ended') {
+    scoreboard = await api.fetchScoreboard(sessionId)
+  }
+
+  await render()
+}
+
+function subscribeToSession() {
+  channel = joinSessionChannel(sessionId, {
+    presenceKey: 'host',
+    presencePayload: { role: 'host' },
+    onChange: handleBroadcast,
+    onPresenceSync: () => {},
+    onSubscribed: resyncSessionState,
+    onError: () => resyncSessionState(),
+  })
+
+  expiryPoll = setInterval(() => {
+    if (session?.status === 'question_live') api.tryAdvanceIfExpired(sessionId)
+  }, 1000)
+}
+
+window.addEventListener('focus', () => {
+  resyncSessionState().catch(console.error)
+})
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    resyncSessionState().catch(console.error)
+  }
+})
+
 boot()
