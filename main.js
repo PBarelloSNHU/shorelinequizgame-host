@@ -115,7 +115,10 @@ function render() {
         correctIndex: revealed.correct_index,
         scoreboard,
         isLastQuestion: session.current_question_index + 1 >= session.question_count,
-        onNext: () => api.advanceQuestion(sessionId),
+	onNext: async () => {
+  		if (session.status !== 'reveal') return
+  		await api.advanceQuestion(sessionId)
+	}
       })
       break
     case 'ended':
