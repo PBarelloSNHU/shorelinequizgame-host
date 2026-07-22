@@ -143,16 +143,25 @@ export async function fetchScoreboard(sessionId) {
 }
 
 export async function fetchAnsweredCount(sessionId, orderIndex) {
-  const { count, error } = await supabase
-    .from('quiz_responses')
-    .select('*', { count: 'exact', head: true })
-    .eq('session_id', sessionId)
-    .eq('order_index', orderIndex)
+  const { data, error } = await supabase.rpc('get_answered_count', {
+    p_session_id: sessionId,
+    p_order_index: orderIndex,
+  })
 
-  throwNormalized(error, 'fetchAnsweredCount')
-  return count ?? 0
+  if (error) {
+    console.error('[api] fetchAnsweredCount', error)
+    throw {
+      message: error.message || 'fetchAnsweredCount failed',
+      code: error.code ?? null,
+      details: error.details ?? null,
+      hint: error.hint ?? null,
+      context: 'fetchAnsweredCount',
+      raw: error,
+    }
+  }
+
+  return data ?? 0
 }
-
 export async function fetchCurrentQuestion(sessionId) {
   const { data, error } = await supabase.rpc('get_current_question', {
     p_session_id: sessionId,
