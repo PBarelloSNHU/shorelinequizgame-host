@@ -96,9 +96,14 @@ async function handleBroadcast(payload) {
   }
 
   if (table === 'quiz_responses') {
-    if (session?.status === 'question_live') {
-      answeredCount = await api.fetchAnsweredCount(sessionId, session.current_question_index)
+    try {
+      answeredCount = await api.fetchAnsweredCount(
+        sessionId,
+        session?.current_question_index ?? 0
+      )
       render()
+    } catch (err) {
+      console.warn('Failed to refresh answered count:', err)
     }
   }
 }
@@ -115,16 +120,19 @@ async function resyncSessionState() {
     revealedQuestion = null
     answeredCount = 0
 
-    if (session.status === 'question_live') {
+    if (session.status === 'lobby') {
+      scoreboard = []
+    } else if (session.status === 'question_live') {
       currentQuestion = await api.fetchCurrentQuestion(sessionId)
-      answeredCount = await api.fetchAnsweredCount(sessionId, session.current_question_index)
+      answeredCount = await api.fetchAnsweredCount(
+        sessionId,
+        session.current_question_index
+      )
     } else if (session.status === 'reveal') {
       revealedQuestion = await api.fetchRevealedQuestion(sessionId)
       scoreboard = await api.fetchScoreboard(sessionId)
     } else if (session.status === 'ended') {
       scoreboard = await api.fetchScoreboard(sessionId)
-    } else {
-      scoreboard = []
     }
 
     render()
@@ -173,9 +181,9 @@ function render() {
         question: revealedQuestion,
         correctIndex: revealedQuestion.correct_index,
         scoreboard,
-        isLastQuestion: session.current_question_index + 1 >= session.question_count,
+        isLastQuestion:
+          session.current_question_index + 1 >= session.question_count,
         onNext: async () => {
-          if (session.status !== 'reveal') return
           await api.advanceQuestion(sessionId)
         },
       })
@@ -231,7 +239,7 @@ function resetToSetup() {
 window.addEventListener('focus', () => {
   if (sessionId) {
     resyncSessionState().catch((err) => {
-      console.error('Focus resync failed:', err)
+      console.error('Host focus resync failed:', err)
     })
   }
 })
@@ -239,7 +247,7 @@ window.addEventListener('focus', () => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && sessionId) {
     resyncSessionState().catch((err) => {
-      console.error('Visibility resync failed:', err)
+      console.error('Host visibility resync failed:', err)
     })
   }
 })
