@@ -110,3 +110,6 @@ export async function fetchRevealedQuestion(sessionId) {
   if (!data || !data.length) throw new Error('get_revealed_question returned no rows')
   return data[0]
 }
+
+const count = state.playerCount ?? 0;
+const playerLabel = `${count} ${count === 1 ? 'player' : 'players'} in the room`;
