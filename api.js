@@ -80,7 +80,11 @@ export async function advanceQuestion(sessionId) {
     p_session_id: sessionId,
   })
 
-  throwNormalized(error, 'advance_question')
+  if (error) {
+    if (error.message === 'not_in_reveal') return false
+    throw error
+  }
+
   return true
 }
 
