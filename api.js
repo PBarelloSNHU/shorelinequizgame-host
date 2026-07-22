@@ -1,37 +1,15 @@
 import { supabase } from './supabaseClient.js'
 
-function normalizeError(error, context) {
-  if (!error) return null
-
-  const normalized = {
-    message: error.message || `${context} failed`,
-    code: error.code ?? null,
-    details: error.details ?? null,
-    hint: error.hint ?? null,
-    context,
-    raw: error,
+function unwrapSingleRowRpc(data, functionName) {
+  if (Array.isArray(data)) return data[0] ?? null
+  if (data == null) {
+    throw new Error(`${functionName} returned no data`)
   }
-
-  console.error(`[api] ${context}`, normalized)
-  return normalized
+  return data
 }
 
-function throwNormalized(error, context) {
-  const normalized = normalizeError(error, context)
-  if (normalized) throw normalized
-}
-
-function isExpectedNoopError(error) {
-  if (!error) return false
-  const msg = (error.message || '').toLowerCase()
-
-  return (
-    msg === '' ||
-    msg === 'not_in_reveal' ||
-    msg === 'not_revealed_yet' ||
-    msg === 'not_accepting_answers' ||
-    msg.includes('networkerror when attempting to fetch resource')
-  )
+function throwIfError(error) {
+  if (error) throw error
 }
 
 export async function createSession({ level, count, timer }) {
@@ -40,90 +18,43 @@ export async function createSession({ level, count, timer }) {
     p_count: count,
     p_timer: timer,
   })
-
-  throwNormalized(error, 'create_session')
-
-  if (!Array.isArray(data) || !data[0]) {
-    throw {
-      message: 'create_session returned no data',
-      code: 'HOST_API_EMPTY_RESULT',
-      details: null,
-      hint: null,
-      context: 'create_session',
-      raw: data,
-    }
-  }
-
-  return data[0]
+  throwIfError(error)
+  return unwrapSingleRowRpc(data, 'create_session')
 }
 
 export async function startQuestion(sessionId) {
   const { error } = await supabase.rpc('start_question', {
     p_session_id: sessionId,
   })
-
-  throwNormalized(error, 'start_question')
-  return { ok: true }
+  throwIfError(error)
 }
 
 export async function revealQuestion(sessionId) {
   const { error } = await supabase.rpc('reveal_question', {
     p_session_id: sessionId,
   })
-
-  throwNormalized(error, 'reveal_question')
-  return { ok: true }
+  throwIfError(error)
 }
 
 export async function advanceQuestion(sessionId) {
   const { error } = await supabase.rpc('advance_question', {
     p_session_id: sessionId,
   })
-
-  if (error) {
-    if ((error.message || '').toLowerCase() === 'not_in_reveal') {
-      console.warn('[api] advance_question ignored: session is not in reveal yet', error)
-      return {
-        ok: false,
-        ignored: true,
-        reason: 'not_in_reveal',
-      }
-    }
-
-    throwNormalized(error, 'advance_question')
-  }
-
-  return { ok: true }
+  throwIfError(error)
 }
 
 export async function endSession(sessionId) {
   const { error } = await supabase.rpc('end_session', {
     p_session_id: sessionId,
   })
-
-  throwNormalized(error, 'end_session')
-  return { ok: true }
+  throwIfError(error)
 }
 
 export async function tryAdvanceIfExpired(sessionId) {
   const { error } = await supabase.rpc('try_advance_if_expired', {
     p_session_id: sessionId,
   })
-
-  if (error) {
-    if (isExpectedNoopError(error)) {
-      console.debug('[api] try_advance_if_expired noop', error)
-      return {
-        ok: false,
-        ignored: true,
-        reason: error.message || 'noop',
-      }
-    }
-
-    throwNormalized(error, 'try_advance_if_expired')
-  }
-
-  return { ok: true }
+  throwIfError(error)
 }
 
 export async function fetchSession(sessionId) {
@@ -133,7 +64,7 @@ export async function fetchSession(sessionId) {
     .eq('id', sessionId)
     .single()
 
-  throwNormalized(error, 'fetchSession')
+  throwIfError(error)
   return data
 }
 
@@ -144,7 +75,7 @@ export async function fetchRoster(sessionId) {
     .eq('session_id', sessionId)
     .order('joined_at', { ascending: true })
 
-  throwNormalized(error, 'fetchRoster')
+  throwIfError(error)
   return data ?? []
 }
 
@@ -155,41 +86,33 @@ export async function fetchScoreboard(sessionId) {
     .eq('session_id', sessionId)
     .order('total_score', { ascending: false })
 
-  throwNormalized(error, 'fetchScoreboard')
+  throwIfError(error)
   return data ?? []
 }
 
 export async function fetchAnsweredCount(sessionId, orderIndex) {
-  const { data, error } = await supabase.rpc('get_answered_count', {
-    p_session_id: sessionId,
-    p_order_index: orderIndex,
-  })
-  if (error) throw error
-  return data ?? 0
+  const { count, error } = await supabase
+    .from('quiz_responses')
+    .select('*', { count: 'exact', head: true })
+    .eq('session_id', sessionId)
+    .eq('order_index', orderIndex)
+
+  throwIfError(error)
+  return count ?? 0
 }
 
 export async function fetchCurrentQuestion(sessionId) {
   const { data, error } = await supabase.rpc('get_current_question', {
     p_session_id: sessionId,
   })
-
-  throwNormalized(error, 'get_current_question')
-  return Array.isArray(data) ? (data[0] ?? null) : null
+  throwIfError(error)
+  return unwrapSingleRowRpc(data, 'get_current_question')
 }
 
 export async function fetchRevealedQuestion(sessionId) {
   const { data, error } = await supabase.rpc('get_revealed_question', {
     p_session_id: sessionId,
   })
-
-  if (error) {
-    if ((error.message || '').toLowerCase() === 'not_revealed_yet') {
-      console.warn('[api] get_revealed_question ignored: not revealed yet', error)
-      return null
-    }
-
-    throwNormalized(error, 'get_revealed_question')
-  }
-
-  return Array.isArray(data) ? (data[0] ?? null) : null
+  throwIfError(error)
+  return unwrapSingleRowRpc(data, 'get_revealed_question')
 }
