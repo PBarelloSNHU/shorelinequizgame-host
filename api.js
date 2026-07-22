@@ -91,14 +91,13 @@ export async function fetchScoreboard(sessionId) {
 }
 
 export async function fetchAnsweredCount(sessionId, orderIndex) {
-  const { count, error } = await supabase
-    .from('quiz_responses')
-    .select('*', { count: 'exact', head: true })
-    .eq('session_id', sessionId)
-    .eq('order_index', orderIndex)
+  const { data, error } = await supabase.rpc('get_answered_count', {
+    p_session_id: sessionId,
+    p_order_index: orderIndex,
+  })
 
   throwIfError(error)
-  return count ?? 0
+  return typeof data === 'number' ? data : 0
 }
 
 export async function fetchCurrentQuestion(sessionId) {
