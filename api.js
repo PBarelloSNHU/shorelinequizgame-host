@@ -111,5 +111,3 @@ export async function fetchRevealedQuestion(sessionId) {
   return data[0]
 }
 
-const count = state.playerCount ?? 0;
-const playerLabel = `${count} ${count === 1 ? 'player' : 'players'} in the room`;
