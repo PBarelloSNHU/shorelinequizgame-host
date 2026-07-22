@@ -23,18 +23,16 @@ function throwNormalized(error, context) {
 
 function isExpectedNoopError(error) {
   if (!error) return false
-
   const msg = (error.message || '').toLowerCase()
+
   return (
     msg === '' ||
-    msg.includes('not_in_reveal') ||
-    msg.includes('notrevealedyet') ||
-    msg.includes('notacceptinganswers')
+    msg === 'not_in_reveal' ||
+    msg === 'not_revealed_yet' ||
+    msg === 'not_accepting_answers' ||
+    msg.includes('networkerror when attempting to fetch resource')
   )
 }
-
-// Thin wrappers around the Postgres RPCs. These are the host-side
-// equivalent of what would have been Socket.io event emitters.
 
 export async function createSession({ level, count, timer }) {
   const { data, error } = await supabase.rpc('create_session', {
@@ -49,12 +47,14 @@ export async function createSession({ level, count, timer }) {
     throw {
       message: 'create_session returned no data',
       code: 'HOST_API_EMPTY_RESULT',
+      details: null,
+      hint: null,
       context: 'create_session',
       raw: data,
     }
   }
 
-  return data[0] // { join_code, session_id }
+  return data[0]
 }
 
 export async function startQuestion(sessionId) {
@@ -63,7 +63,7 @@ export async function startQuestion(sessionId) {
   })
 
   throwNormalized(error, 'start_question')
-  return true
+  return { ok: true }
 }
 
 export async function revealQuestion(sessionId) {
@@ -72,7 +72,7 @@ export async function revealQuestion(sessionId) {
   })
 
   throwNormalized(error, 'reveal_question')
-  return true
+  return { ok: true }
 }
 
 export async function advanceQuestion(sessionId) {
@@ -81,11 +81,19 @@ export async function advanceQuestion(sessionId) {
   })
 
   if (error) {
-    if (error.message === 'not_in_reveal') return false
-    throw error
+    if ((error.message || '').toLowerCase() === 'not_in_reveal') {
+      console.warn('[api] advance_question ignored: session is not in reveal yet', error)
+      return {
+        ok: false,
+        ignored: true,
+        reason: 'not_in_reveal',
+      }
+    }
+
+    throwNormalized(error, 'advance_question')
   }
 
-  return true
+  return { ok: true }
 }
 
 export async function endSession(sessionId) {
@@ -94,7 +102,7 @@ export async function endSession(sessionId) {
   })
 
   throwNormalized(error, 'end_session')
-  return true
+  return { ok: true }
 }
 
 export async function tryAdvanceIfExpired(sessionId) {
@@ -105,12 +113,17 @@ export async function tryAdvanceIfExpired(sessionId) {
   if (error) {
     if (isExpectedNoopError(error)) {
       console.debug('[api] try_advance_if_expired noop', error)
-      return false
+      return {
+        ok: false,
+        ignored: true,
+        reason: error.message || 'noop',
+      }
     }
+
     throwNormalized(error, 'try_advance_if_expired')
   }
 
-  return true
+  return { ok: true }
 }
 
 export async function fetchSession(sessionId) {
@@ -152,20 +165,10 @@ export async function fetchAnsweredCount(sessionId, orderIndex) {
     p_order_index: orderIndex,
   })
 
-  if (error) {
-    console.error('[api] fetchAnsweredCount', error)
-    throw {
-      message: error.message || 'fetchAnsweredCount failed',
-      code: error.code ?? null,
-      details: error.details ?? null,
-      hint: error.hint ?? null,
-      context: 'fetchAnsweredCount',
-      raw: error,
-    }
-  }
-
+  throwNormalized(error, 'fetchAnsweredCount')
   return data ?? 0
 }
+
 export async function fetchCurrentQuestion(sessionId) {
   const { data, error } = await supabase.rpc('get_current_question', {
     p_session_id: sessionId,
@@ -180,6 +183,14 @@ export async function fetchRevealedQuestion(sessionId) {
     p_session_id: sessionId,
   })
 
-  throwNormalized(error, 'get_revealed_question')
+  if (error) {
+    if ((error.message || '').toLowerCase() === 'not_revealed_yet') {
+      console.warn('[api] get_revealed_question ignored: not revealed yet', error)
+      return null
+    }
+
+    throwNormalized(error, 'get_revealed_question')
+  }
+
   return Array.isArray(data) ? (data[0] ?? null) : null
 }
