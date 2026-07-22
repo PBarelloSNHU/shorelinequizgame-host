@@ -1,344 +1,229 @@
-import { ensureAnonymousSession } from './supabaseClient.js'
-import * as api from './api.js'
-import { joinSessionChannel } from './realtimeChannel.js'
-import {
-  renderSetup,
-  renderLobby,
-  renderQuestionLive,
-  renderReveal,
-  renderGameOver,
-} from './views.js'
+// main.js — Shoreline Quiz Game Host
 
-const app = document.querySelector('#app')
+const state = {
+  isLoading: true,
+  loadError: null,
+  session: null, // { status, rosterCount, answeredCount, currentQuestionIndex, scoreboardCount, questions, answers }
+};
 
-let sessionId = localStorage.getItem('tq357_host_session_id')
-let joinCode = localStorage.getItem('tq357_host_join_code')
-
-let session = null
-let roster = []
-let scoreboard = []
-let answeredCount = 0
-let currentQuestion = null
-let revealedQuestion = null
-let channel = null
-let expiryPoll = null
-let resyncPromise = null
-
-async function boot() {
-  await ensureAnonymousSession()
-
-  if (!sessionId) {
-    renderSetup(app, { onCreate: handleCreate })
-    return
-  }
-
-  try {
-    subscribeToSession()
-    await resyncSessionState()
-  } catch (err) {
-    console.error('Failed to restore host session:', err)
-    resetToSetup()
-  }
-}
-
-async function handleCreate({ level, count, timer }) {
-  try {
-    const created = await api.createSession({ level, count, timer })
-    sessionId = created.session_id
-    joinCode = created.join_code
-
-    localStorage.setItem('tq357_host_session_id', sessionId)
-    localStorage.setItem('tq357_host_join_code', joinCode)
-
-    subscribeToSession()
-    await resyncSessionState()
-  } catch (err) {
-    console.error('Failed to create host session:', err)
-    resetToSetup()
-  }
-}
-
-function subscribeToSession() {
-  if (!sessionId || channel) return
-
-  channel = joinSessionChannel(sessionId, {
-    presenceKey: 'host',
-    presencePayload: { role: 'host' },
-    onChange: handleBroadcast,
-    onPresenceSync: () => {},
-  })
-
-  if (!expiryPoll) {
-    expiryPoll = setInterval(async () => {
-      if (session?.status !== 'question_live') return
-
-      try {
-        console.log('[host] tryAdvanceIfExpired tick', {
-          sessionId,
-          status: session.status,
-          current_question_index: session.current_question_index,
-        })
-
-        await api.tryAdvanceIfExpired(sessionId)
-
-        const freshSession = await api.fetchSession(sessionId)
-        if (freshSession.status !== session.status) {
-          session = freshSession
-          await resyncSessionState()
-        }
-      } catch (err) {
-        console.warn('[host] expiry poll failed:', err)
-      }
-    }, 1000)
-  }
-}
-
-async function handleBroadcast(payload) {
-  console.log(
-    '[host] broadcast received:',
-    payload?.table,
-    payload?.record?.status,
-    payload
-  )
-
-  const table = payload?.table
-
-  if (table === 'quiz_sessions') {
-    session = payload.record
-
-    try {
-      await resyncSessionState()
-    } catch (err) {
-      console.error('[host] resync after quiz_sessions broadcast failed:', err)
-    }
-    return
-  }
-
-  if (!sessionId) return
-
-  if (table === 'quiz_players') {
-    try {
-      roster = await api.fetchRoster(sessionId)
-      render()
-    } catch (err) {
-      console.warn('[host] failed to refresh roster:', err)
-    }
-    return
-  }
-
-  if (table === 'quiz_scores') {
-    try {
-      scoreboard = await api.fetchScoreboard(sessionId)
-      render()
-    } catch (err) {
-      console.warn('[host] failed to refresh scoreboard:', err)
-    }
-    return
-  }
-
-  if (table === 'quiz_responses') {
-    try {
-      answeredCount = await api.fetchAnsweredCount(
-        sessionId,
-        session?.current_question_index ?? 0
-      )
-      render()
-    } catch (err) {
-      console.warn('[host] failed to refresh answered count:', err)
-    }
-  }
-}
-
-async function resyncSessionState() {
-  if (!sessionId) return
-  if (resyncPromise) return resyncPromise
-
-  resyncPromise = (async () => {
-    const freshSession = await api.fetchSession(sessionId)
-    const freshRoster = await api.fetchRoster(sessionId)
-
-    session = freshSession
-    roster = freshRoster
-
-    currentQuestion = null
-    revealedQuestion = null
-    answeredCount = 0
-
-    if (session.status === 'lobby') {
-      scoreboard = []
-    } else if (session.status === 'question_live') {
-      currentQuestion = await api.fetchCurrentQuestion(sessionId)
-      answeredCount = await api.fetchAnsweredCount(
-        sessionId,
-        session.current_question_index
-      )
-    } else if (session.status === 'reveal') {
-      revealedQuestion = await api.fetchRevealedQuestion(sessionId)
-      scoreboard = await api.fetchScoreboard(sessionId)
-    } else if (session.status === 'ended') {
-      scoreboard = await api.fetchScoreboard(sessionId)
-    }
-
-    console.log('[host] resynced session state:', {
-      status: session.status,
-      rosterCount: roster.length,
-      answeredCount,
-      currentQuestionIndex: session.current_question_index,
-      scoreboardCount: scoreboard.length,
-    })
-
-    render()
-  })()
-
-  try {
-    await resyncPromise
-  } finally {
-    resyncPromise = null
-  }
-}
+const rootEl = document.getElementById('app');
 
 function render() {
-  if (!session) {
-    renderSetup(app, { onCreate: handleCreate })
-    return
+  console.log('[host] render status:', state.session?.status ?? 'none', {
+    isLoading: state.isLoading,
+    answeredCount: state.session?.answeredCount,
+  });
+
+  // 1. Only show Loading... while we have no session data at all.
+  if (state.isLoading) {
+    rootEl.innerHTML = renderLoading();
+    return;
   }
 
-  console.log('[host] render status:', session.status)
+  if (state.loadError) {
+    rootEl.innerHTML = renderError(state.loadError);
+    return;
+  }
 
-  switch (session.status) {
+  if (!state.session) {
+    rootEl.innerHTML = renderEmptySession();
+    return;
+  }
+
+  const { status } = state.session;
+
+  switch (status) {
     case 'lobby':
-      renderLobby(app, {
-        joinCode,
-        roster,
-        onStart: handleStartQuestion,
-      })
-      break
-
-    case 'question_live':
-      if (!currentQuestion) return
-
-      renderQuestionLive(app, {
-        question: currentQuestion,
-        session,
-        answeredCount,
-        rosterCount: roster.length,
-        onLockNow: async () => {
-          try {
-            await api.revealQuestion(sessionId)
-            await resyncSessionState()
-          } catch (err) {
-            console.error('[host] revealQuestion failed:', err)
-          }
-        },
-      })
-      break
-
+      rootEl.innerHTML = renderLobby(state.session);
+      break;
+    case 'question':
+      rootEl.innerHTML = renderQuestion(state.session);
+      break;
     case 'reveal':
-      if (!revealedQuestion) return
-
-      renderReveal(app, {
-        question: revealedQuestion,
-        correctIndex: revealedQuestion.correct_index,
-        scoreboard,
-        isLastQuestion:
-          session.current_question_index + 1 >= session.question_count,
-        onNext: async () => {
-          try {
-            await api.advanceQuestion(sessionId)
-            await resyncSessionState()
-          } catch (err) {
-            console.error('[host] advanceQuestion failed:', err)
-          }
-        },
-      })
-      break
-
-    case 'ended':
-      renderGameOver(app, {
-        scoreboard,
-        onNewSession: handleNewSession,
-      })
-      break
-
+      // 2. Reveal is a valid, fully-loaded state even when answeredCount is 0.
+      rootEl.innerHTML = renderReveal(state.session);
+      break;
+    case 'scoreboard':
+      rootEl.innerHTML = renderScoreboard(state.session);
+      break;
     default:
-      console.warn('[host] unknown session status:', session.status)
+      rootEl.innerHTML = renderUnknownStatus(status);
   }
 }
 
-async function handleStartQuestion() {
-  try {
-    await api.startQuestion(sessionId)
-
-    // Optimistic fast-path for the host so the question/timer appears
-    // immediately instead of waiting on realtime delivery.
-    session = await api.fetchSession(sessionId)
-
-    if (session.status === 'question_live') {
-      currentQuestion = await api.fetchCurrentQuestion(sessionId)
-      answeredCount = await api.fetchAnsweredCount(
-        sessionId,
-        session.current_question_index
-      )
-    }
-
-    render()
-
-    // Follow with a full resync so roster/derived state stay canonical.
-    await resyncSessionState()
-  } catch (err) {
-    console.error('[host] startQuestion failed:', err)
-  }
+function renderLoading() {
+  return `<div class="host-loading">Loading...</div>`;
 }
 
-function handleNewSession() {
-  clearHostedSession()
-  renderSetup(app, { onCreate: handleCreate })
+function renderError(message) {
+  return `<div class="host-error">${escapeHtml(message)}</div>`;
 }
 
-function clearHostedSession() {
-  localStorage.removeItem('tq357_host_session_id')
-  localStorage.removeItem('tq357_host_join_code')
-
-  if (channel) {
-    channel.unsubscribe()
-    channel = null
-  }
-
-  if (expiryPoll) {
-    clearInterval(expiryPoll)
-    expiryPoll = null
-  }
-
-  sessionId = null
-  joinCode = null
-  session = null
-  roster = []
-  scoreboard = []
-  answeredCount = 0
-  currentQuestion = null
-  revealedQuestion = null
-  resyncPromise = null
+function renderEmptySession() {
+  return `<div class="host-empty">No session found.</div>`;
 }
 
-function resetToSetup() {
-  clearHostedSession()
-  renderSetup(app, { onCreate: handleCreate })
+function renderUnknownStatus(status) {
+  return `<div class="host-error">Unknown session status: ${escapeHtml(String(status))}</div>`;
 }
 
-window.addEventListener('focus', () => {
-  if (sessionId) {
-    resyncSessionState().catch((err) => {
-      console.error('[host] focus resync failed:', err)
-    })
-  }
-})
+function renderHeader(session) {
+  const totalQuestions = session.questions?.length ?? 0;
+  const questionNumber = totalQuestions > 0 ? session.currentQuestionIndex + 1 : 0;
 
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && sessionId) {
-    resyncSessionState().catch((err) => {
-      console.error('[host] visibility resync failed:', err)
-    })
-  }
-})
+  return `
+    <header class="host-header">
+      <div>Status: ${escapeHtml(session.status)}</div>
+      <div>Players: ${session.rosterCount}</div>
+      <div>Answered: ${session.answeredCount}</div>
+      <div>Question: ${questionNumber}/${totalQuestions}</div>
+    </header>
+  `;
+}
 
-boot()
+function renderLobby(session) {
+  return `
+    ${renderHeader(session)}
+    <section class="host-lobby">
+      <h1>Lobby</h1>
+      <p>${session.rosterCount} player(s) connected.</p>
+    </section>
+  `;
+}
+
+function getCurrentQuestion(session) {
+  const questions = session.questions ?? [];
+  return questions[session.currentQuestionIndex] ?? null;
+}
+
+function renderQuestion(session) {
+  const question = getCurrentQuestion(session);
+
+  const body = question
+    ? `
+      <h1>Question ${session.currentQuestionIndex + 1}</h1>
+      <p>${escapeHtml(question.prompt)}</p>
+      <p>Answers received: ${session.answeredCount} / ${session.rosterCount}</p>
+    `
+    : `
+      <h1>Question</h1>
+      <p>Question ${session.currentQuestionIndex + 1} is not available yet.</p>
+    `;
+
+  return `
+    ${renderHeader(session)}
+    <section class="host-question">${body}</section>
+  `;
+}
+
+// 3. Reveal view: explicitly separates "no answers" from "loading".
+function renderReveal(session) {
+  const question = getCurrentQuestion(session);
+  const answers = session.answers ?? [];
+  const answeredCount = session.answeredCount ?? 0;
+
+  if (!question) {
+    return `
+      ${renderHeader(session)}
+      <section class="host-reveal">
+        <h1>Reveal</h1>
+        <p>Question data is unavailable.</p>
+      </section>
+    `;
+  }
+
+  const answersMarkup =
+    answeredCount === 0
+      ? `<p class="reveal-empty">No players answered this question.</p>`
+      : `
+        <p>${answeredCount} answer(s) submitted.</p>
+        <ul class="reveal-answers">
+          ${answers
+            .map(
+              (answer) =>
+                `<li>${escapeHtml(String(answer.playerId))}: choice ${
+                  answer.choiceIndex + 1
+                }${answer.isCorrect ? ' ✓' : ''}</li>`
+            )
+            .join('')}
+        </ul>
+      `;
+
+  const correctAnswerMarkup =
+    typeof question.correctIndex === 'number'
+      ? `<p>Correct answer: choice ${question.correctIndex + 1}</p>`
+      : '';
+
+  return `
+    ${renderHeader(session)}
+    <section class="host-reveal">
+      <h1>Reveal</h1>
+      <p>${escapeHtml(question.prompt)}</p>
+      ${answersMarkup}
+      ${correctAnswerMarkup}
+    </section>
+  `;
+}
+
+function renderScoreboard(session) {
+  return `
+    ${renderHeader(session)}
+    <section class="host-scoreboard">
+      <h1>Scoreboard</h1>
+      <p>${session.scoreboardCount} player score entries available.</p>
+    </section>
+  `;
+}
+
+function escapeHtml(value) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+// --- Session subscription wiring ---
+
+function handleSessionUpdate(nextSession) {
+  console.log('[host] resynced session state:', nextSession);
+
+  // Data has arrived — loading is over, regardless of answeredCount.
+  state.isLoading = false;
+  state.loadError = null;
+  state.session = nextSession;
+
+  render();
+}
+
+function handleSessionError(error) {
+  console.error('[host] session subscribe error:', error);
+
+  state.isLoading = false;
+  state.loadError = 'Unable to load session.';
+
+  render();
+}
+
+function initHost(sessionId, subscribeToSession) {
+  state.isLoading = true;
+  state.loadError = null;
+  state.session = null;
+  render();
+
+  const unsubscribe = subscribeToSession(
+    sessionId,
+    handleSessionUpdate,
+    handleSessionError
+  );
+
+  window.addEventListener('beforeunload', () => {
+    if (typeof unsubscribe === 'function') unsubscribe();
+  });
+}
+
+// Example wiring — replace with your real transport (WebSocket, Firebase, etc.)
+// initHost(sessionId, subscribeToSession);
+
+export { initHost, render, state };
