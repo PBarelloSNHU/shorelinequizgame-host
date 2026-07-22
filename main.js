@@ -1,11 +1,12 @@
 // main.js — Shoreline Quiz Game Host
 import * as api from './api.js'
 import { joinSessionChannel } from './realtimeChannel.js'
+import { ensureAnonymousSession } from './supabaseClient.js'
 
 const state = {
   isLoading: true,
   loadError: null,
-  session: null, // { status, rosterCount, answeredCount, currentQuestionIndex, scoreboardCount, question, answers, joinCode }
+  session: null, // { status, joinCode, rosterCount, answeredCount, currentQuestionIndex, totalQuestions, scoreboardCount, question, scoreboard }
 }
 
 const rootEl = document.getElementById('app')
@@ -43,7 +44,7 @@ function render() {
       wireControl('#start-question-btn', api.startQuestion)
       wireControl('#end-session-btn', api.endSession)
       break
-    case 'question':
+    case 'question_live':
       rootEl.innerHTML = renderQuestion(state.session)
       wireControl('#reveal-btn', api.revealQuestion)
       wireControl('#end-session-btn', api.endSession)
@@ -53,9 +54,9 @@ function render() {
       wireControl('#advance-btn', api.advanceQuestion)
       wireControl('#end-session-btn', api.endSession)
       break
-    case 'scoreboard':
     case 'ended':
       rootEl.innerHTML = renderScoreboard(state.session)
+      wireControl('#new-session-btn', null, startNewSession)
       break
     default:
       rootEl.innerHTML = renderUnknownStatus(status)
@@ -79,13 +80,13 @@ function renderSetupScreen() {
   return `
     <div class="host-setup">
       <h1>Start a New Quiz</h1>
-      <label>Level
+      <label>CASAS Level
         <select id="setup-level">
-          <option value="200">200</option>
-          <option value="210">210</option>
-          <option value="220">220</option>
-          <option value="230">230</option>
-          <option value="240">240</option>
+          <option value="1">1 (Beginning)</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+          <option value="5">5 (Advanced)</option>
         </select>
       </label>
       <label>Question count
@@ -122,6 +123,7 @@ function renderLobby(session) {
     ${renderHeader(session)}
     <section class="host-lobby">
       <h1>Lobby</h1>
+      <p>Join code: <strong>${escapeHtml(session.joinCode ?? '—')}</strong></p>
       <p>${session.rosterCount} player(s) connected.</p>
       <button id="start-question-btn">Start Question</button>
       <button id="end-session-btn">End Session</button>
@@ -166,8 +168,8 @@ function renderReveal(session) {
       : `<p>${answeredCount} answer(s) submitted.</p>`
 
   const correctAnswerMarkup =
-    typeof question.correctIndex === 'number'
-      ? `<p>Correct answer: choice ${question.correctIndex + 1}</p>`
+    typeof question.correct_index === 'number'
+      ? `<p>Correct answer: choice ${question.correct_index + 1}</p>`
       : ''
 
   return `
@@ -183,11 +185,21 @@ function renderReveal(session) {
 }
 
 function renderScoreboard(session) {
+  const rows = (session.scoreboard ?? [])
+    .map(
+      (row, i) => `
+        <li>${i + 1}. ${escapeHtml(row.quiz_players?.display_name ?? row.player_id)} —
+          ${row.total_score} pts (${row.correct_count} correct)</li>
+      `
+    )
+    .join('')
+
   return `
     ${renderHeader(session)}
     <section class="host-scoreboard">
-      <h1>Scoreboard</h1>
-      <p>${session.scoreboardCount} player score entries available.</p>
+      <h1>Final Scoreboard</h1>
+      <ol>${rows || '<li>No scores recorded.</li>'}</ol>
+      <button id="new-session-btn">Start New Session</button>
     </section>
   `
 }
@@ -216,12 +228,15 @@ function wireRetry() {
 }
 
 function wireSetup() {
-  document.getElementById('create-session-btn')?.addEventListener('click', async () => {
+  document.getElementById('create-session-btn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget
+    btn.disabled = true
     const level = Number(document.getElementById('setup-level').value)
     const count = Number(document.getElementById('setup-count').value)
     const timer = Number(document.getElementById('setup-timer').value)
 
     try {
+      await ensureAnonymousSession()
       const { session_id } = await api.createSession({ level, count, timer })
       const url = new URL(window.location.href)
       url.searchParams.set('session', session_id)
@@ -229,23 +244,46 @@ function wireSetup() {
       initHost(session_id)
     } catch (err) {
       console.error('[host] failed to create session', err)
-      state.loadError = 'Failed to create session. Please try again.'
+      state.isLoading = false
+      state.loadError = `Failed to create session: ${err.message ?? 'unknown error'}`
       render()
+    } finally {
+      btn.disabled = false
     }
   })
 }
 
-function wireControl(selector, apiFn) {
+function startNewSession() {
+  const url = new URL(window.location.href)
+  url.searchParams.delete('session')
+  url.searchParams.delete('code')
+  window.history.replaceState({}, '', url)
+  if (channel) {
+    channel.unsubscribe()
+    channel = null
+  }
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+  state.isLoading = false
+  state.loadError = null
+  state.session = null
+  render()
+}
+
+function wireControl(selector, apiFn, customHandler) {
   const el = document.querySelector(selector)
   if (!el) return
   el.addEventListener('click', async () => {
+    if (customHandler) return customHandler()
     el.disabled = true
     try {
       await apiFn(getSessionIdFromUrl())
       await resyncHostState()
     } catch (err) {
       console.error('[host] control action failed', err)
-      state.loadError = 'Action failed. Please retry.'
+      state.loadError = `Action failed: ${err.message ?? 'unknown error'}`
       render()
     } finally {
       el.disabled = false
@@ -279,17 +317,18 @@ async function resyncHostState() {
         answeredCount: 0,
         scoreboardCount: 0,
         question: null,
+        scoreboard: [],
       }
 
-      if (rawSession.status === 'question') {
+      if (rawSession.status === 'question_live') {
         next.question = await api.fetchCurrentQuestion(sessionId)
         next.answeredCount = await api.fetchAnsweredCount(sessionId, next.currentQuestionIndex)
       } else if (rawSession.status === 'reveal') {
         next.question = await api.fetchRevealedQuestion(sessionId)
         next.answeredCount = await api.fetchAnsweredCount(sessionId, next.currentQuestionIndex)
-      } else if (rawSession.status === 'scoreboard' || rawSession.status === 'ended') {
-        const scoreboard = await api.fetchScoreboard(sessionId)
-        next.scoreboardCount = scoreboard.length
+      } else if (rawSession.status === 'ended') {
+        next.scoreboard = await api.fetchScoreboard(sessionId)
+        next.scoreboardCount = next.scoreboard.length
       }
 
       state.isLoading = false
@@ -298,7 +337,7 @@ async function resyncHostState() {
     } catch (err) {
       console.error('[host] failed to resync host state', err)
       state.isLoading = false
-      state.loadError = 'Unable to load session. It may have ended or the code is invalid.'
+      state.loadError = `Unable to load session: ${err.message ?? 'it may have ended or the code is invalid'}`
     }
 
     render()
@@ -313,14 +352,7 @@ async function resyncHostState() {
 
 // ---------- Boot ----------
 
-function handleSessionError(error) {
-  console.error('[host] session subscribe error', error)
-  state.isLoading = false
-  state.loadError = 'Unable to load session.'
-  render()
-}
-
-function initHost(sessionId) {
+async function initHost(sessionId) {
   state.isLoading = true
   state.loadError = null
   state.session = null
@@ -335,7 +367,17 @@ function initHost(sessionId) {
     pollTimer = null
   }
 
-  resyncHostState()
+  try {
+    await ensureAnonymousSession()
+  } catch (err) {
+    console.error('[host] anonymous auth failed', err)
+    state.isLoading = false
+    state.loadError = 'Unable to authenticate. Please refresh and try again.'
+    render()
+    return
+  }
+
+  await resyncHostState()
 
   channel = joinSessionChannel(sessionId, {
     presenceKey: 'host',
@@ -361,10 +403,14 @@ const initialSessionId = getSessionIdFromUrl()
 if (initialSessionId) {
   initHost(initialSessionId)
 } else {
-  state.isLoading = false
-  state.loadError = null
-  state.session = null
-  render()
+  ensureAnonymousSession()
+    .catch((err) => console.error('[host] anonymous auth failed on boot', err))
+    .finally(() => {
+      state.isLoading = false
+      state.loadError = null
+      state.session = null
+      render()
+    })
 }
 
 export { initHost, render, state }
