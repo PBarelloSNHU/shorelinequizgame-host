@@ -164,8 +164,7 @@ export async function fetchAnsweredCount(sessionId, orderIndex) {
     p_session_id: sessionId,
     p_order_index: orderIndex,
   })
-
-  throwNormalized(error, 'fetchAnsweredCount')
+  if (error) throw error
   return data ?? 0
 }
 
