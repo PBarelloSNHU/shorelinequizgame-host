@@ -23,7 +23,9 @@ export async function createSession({ level, count, timerSeconds }) {
 export async function fetchSession(sessionId) {
   const { data, error } = await supabase
     .from('quiz_sessions')
-    .select('id, status, join_code, casas_level, current_question_index, question_count, timer_seconds, question_started_at')
+    .select(
+      'id, status, join_code, casas_level, current_question_index, question_count, timer_seconds, question_started_at'
+    )
     .eq('id', sessionId)
     .single()
 
@@ -31,8 +33,6 @@ export async function fetchSession(sessionId) {
 
   return {
     ...data,
-    // Normalize to the field name main.js expects, sourced from the
-    // NOT NULL question_count column rather than the nullable total_questions.
     total_questions: data.question_count,
   }
 }
@@ -77,32 +77,34 @@ export async function advanceQuestion(sessionId) {
   if (error) throw error
 }
 
+// Called on a timer tick by the host UI to auto-advance once the
+// question's timer window has elapsed, based on question_started_at
+// + timer_seconds compared against the current time.
 export async function tryAdvanceIfExpired(sessionId) {
-  const { error } = await supabase.rpc('try_advance_if_expired', {
-    p_session_id: sessionId,
-  })
-  if (error) throw error
+  const session = await fetchSession(sessionId)
+
+  if (session.status !== 'active') return false
+  if (!session.question_started_at || !session.timer_seconds) return false
+
+  const startedAt = new Date(session.question_started_at).getTime()
+  const deadline = startedAt + session.timer_seconds * 1000
+
+  if (Date.now() >= deadline) {
+    await revealQuestion(sessionId)
+    return true
+  }
+
+  return false
 }
 
-// ---------- Question + answer data (host view) ----------
+// ---------- Host-facing question + answer state ----------
 
 export async function fetchCurrentQuestionForHost(sessionId) {
   const { data, error } = await supabase.rpc('get_current_question_for_host', {
     p_session_id: sessionId,
   })
   if (error) throw error
-
-  const row = Array.isArray(data) ? data[0] : data
-  if (!row) return null
-
-  return {
-    question: {
-      order_index: row.order_index,
-      prompt: row.prompt,
-      choices: row.choices,
-    },
-    answeredCount: row.answered_count ?? 0,
-  }
+  return Array.isArray(data) ? data[0] ?? null : data
 }
 
 export async function fetchRevealedQuestionForHost(sessionId) {
@@ -110,29 +112,107 @@ export async function fetchRevealedQuestionForHost(sessionId) {
     p_session_id: sessionId,
   })
   if (error) throw error
-
-  const row = Array.isArray(data) ? data[0] : data
-  if (!row) return null
-
-  return {
-    question: {
-      order_index: row.order_index,
-      prompt: row.prompt,
-      choices: row.choices,
-      correct_index: row.correct_index,
-    },
-    answeredCount: row.answered_count ?? 0,
-  }
+  return Array.isArray(data) ? data[0] ?? null : data
 }
 
-// ---------- Scoreboard ----------
+// Convenience wrapper: fetches the right shape of question data
+// depending on the session's current status.
+export async function fetchQuestionForHost(sessionId, status) {
+  if (status === 'reveal' || status === 'ended') {
+    return fetchRevealedQuestionForHost(sessionId)
+  }
+  if (status === 'active') {
+    return fetchCurrentQuestionForHost(sessionId)
+  }
+  return null
+}
 
-export async function fetchScoreboard(sessionId) {
+// ---------- Scores ----------
+
+export async function fetchScores(sessionId) {
   const { data, error } = await supabase
     .from('quiz_scores')
-    .select('player_id, total_score, correct_count, quiz_players(display_name)')
+    .select('player_id, score')
     .eq('session_id', sessionId)
 
   if (error) throw error
   return data ?? []
+}
+
+export async function fetchLeaderboard(sessionId) {
+  const [{ data: scores, error: scoresError }, { data: players, error: playersError }] =
+    await Promise.all([
+      supabase.from('quiz_scores').select('player_id, score').eq('session_id', sessionId),
+      supabase.from('quiz_players').select('id, display_name').eq('session_id', sessionId),
+    ])
+
+  if (scoresError) throw scoresError
+  if (playersError) throw playersError
+
+  const nameById = new Map((players ?? []).map((p) => [p.id, p.display_name]))
+
+  return (scores ?? [])
+    .map((s) => ({
+      player_id: s.player_id,
+      display_name: nameById.get(s.player_id) ?? 'Unknown',
+      score: s.score,
+    }))
+    .sort((a, b) => b.score - a.score)
+}
+
+// ---------- Realtime subscriptions ----------
+
+export function subscribeToSession(sessionId, onChange) {
+  const channel = supabase
+    .channel(`host-session-${sessionId}`)
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'quiz_sessions', filter: `id=eq.${sessionId}` },
+      onChange
+    )
+    .subscribe()
+
+  return () => {
+    supabase.removeChannel(channel)
+  }
+}
+
+export function subscribeToRoster(sessionId, onChange) {
+  const channel = supabase
+    .channel(`host-roster-${sessionId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'quiz_players',
+        filter: `session_id=eq.${sessionId}`,
+      },
+      onChange
+    )
+    .subscribe()
+
+  return () => {
+    supabase.removeChannel(channel)
+  }
+}
+
+export function subscribeToResponses(sessionId, onChange) {
+  const channel = supabase
+    .channel(`host-responses-${sessionId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: '*',
+        schema: 'public',
+        table: 'quiz_responses',
+        filter: `session_id=eq.${sessionId}`,
+      },
+      onChange
+    )
+    .subscribe()
+
+  return () => {
+    supabase.removeChannel(channel)
+  }
 }
