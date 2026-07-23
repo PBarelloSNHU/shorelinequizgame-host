@@ -11,8 +11,6 @@ export async function createSession({ level, count, timerSeconds }) {
   })
   if (error) throw error
 
-  // RPC may return a single row or an array with one row depending on
-  // how the function is declared (returns table vs. returns record).
   const row = Array.isArray(data) ? data[0] : data
   if (!row) throw new Error('create_session returned no data')
 
@@ -25,12 +23,18 @@ export async function createSession({ level, count, timerSeconds }) {
 export async function fetchSession(sessionId) {
   const { data, error } = await supabase
     .from('quiz_sessions')
-    .select('id, status, join_code, level, current_question_index, total_questions, timer_seconds, question_started_at')
+    .select('id, status, join_code, casas_level, current_question_index, question_count, timer_seconds, question_started_at')
     .eq('id', sessionId)
     .single()
 
   if (error) throw error
-  return data
+
+  return {
+    ...data,
+    // Normalize to the field name main.js expects, sourced from the
+    // NOT NULL question_count column rather than the nullable total_questions.
+    total_questions: data.question_count,
+  }
 }
 
 export async function fetchRoster(sessionId) {
