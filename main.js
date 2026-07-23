@@ -6,13 +6,14 @@ import { ensureAnonymousSession } from './supabaseClient.js'
 const state = {
   isLoading: true,
   loadError: null,
-  session: null, // { status, joinCode, rosterCount, answeredCount, currentQuestionIndex, totalQuestions, scoreboardCount, question, scoreboard }
+  session: null, // { status, joinCode, rosterCount, answeredCount, currentQuestionIndex, totalQuestions, scoreboardCount, question, scoreboard, timerSeconds, questionStartedAt }
 }
 
 const rootEl = document.getElementById('app')
 let channel = null
 let resyncPromise = null
 let pollTimer = null
+let timerInterval = null
 
 // ---------- Render ----------
 
@@ -43,23 +44,28 @@ function render() {
       rootEl.innerHTML = renderLobby(state.session)
       wireControl('#start-question-btn', api.startQuestion)
       wireControl('#end-session-btn', api.endSession)
+      stopTimer()
       break
     case 'question_live':
       rootEl.innerHTML = renderQuestion(state.session)
       wireControl('#reveal-btn', api.revealQuestion)
       wireControl('#end-session-btn', api.endSession)
+      startTimer(state.session)
       break
     case 'reveal':
       rootEl.innerHTML = renderReveal(state.session)
       wireControl('#advance-btn', api.advanceQuestion)
       wireControl('#end-session-btn', api.endSession)
+      stopTimer()
       break
     case 'ended':
       rootEl.innerHTML = renderScoreboard(state.session)
       wireControl('#new-session-btn', null, startNewSession)
+      stopTimer()
       break
     default:
       rootEl.innerHTML = renderUnknownStatus(status)
+      stopTimer()
   }
 }
 
@@ -138,6 +144,7 @@ function renderQuestion(session) {
       <h1>Question ${session.currentQuestionIndex + 1}</h1>
       <p>${escapeHtml(question.prompt)}</p>
       <p>Answers received: ${session.answeredCount} / ${session.rosterCount}</p>
+      <div class="timer-display" id="host-timer">--</div>
       <button id="reveal-btn">Reveal Answer</button>
     `
     : `
@@ -213,6 +220,45 @@ function escapeHtml(value) {
     .replace(/'/g, '&#039;')
 }
 
+// ---------- Timer ----------
+
+function startTimer(session) {
+  stopTimer()
+  if (!session.questionStartedAt || !session.timerSeconds) return
+
+  const startedAt = new Date(session.questionStartedAt).getTime()
+  const totalMs = session.timerSeconds * 1000
+  const sessionId = getSessionIdFromUrl()
+
+  const tick = () => {
+    const el = document.getElementById('host-timer')
+    if (!el) {
+      stopTimer()
+      return
+    }
+    const remainingMs = Math.max(0, startedAt + totalMs - Date.now())
+    const remainingSec = Math.ceil(remainingMs / 1000)
+    el.textContent = `${remainingSec}s`
+    el.classList.toggle('timer-low', remainingSec <= 5)
+
+    if (remainingMs <= 0) {
+      stopTimer()
+      api.tryAdvanceIfExpired(sessionId).catch(() => {})
+      resyncHostState()
+    }
+  }
+
+  tick()
+  timerInterval = setInterval(tick, 250)
+}
+
+function stopTimer() {
+  if (timerInterval) {
+    clearInterval(timerInterval)
+    timerInterval = null
+  }
+}
+
 // ---------- Event wiring ----------
 
 function wireRetry() {
@@ -266,6 +312,7 @@ function startNewSession() {
     clearInterval(pollTimer)
     pollTimer = null
   }
+  stopTimer()
   state.isLoading = false
   state.loadError = null
   state.session = null
@@ -318,6 +365,8 @@ async function resyncHostState() {
         scoreboardCount: 0,
         question: null,
         scoreboard: [],
+        timerSeconds: rawSession.timer_seconds,
+        questionStartedAt: rawSession.question_started_at,
       }
 
       if (rawSession.status === 'question_live') {
@@ -366,6 +415,7 @@ async function initHost(sessionId) {
     clearInterval(pollTimer)
     pollTimer = null
   }
+  stopTimer()
 
   try {
     await ensureAnonymousSession()
@@ -396,6 +446,7 @@ async function initHost(sessionId) {
   window.addEventListener('beforeunload', () => {
     if (channel) channel.unsubscribe()
     if (pollTimer) clearInterval(pollTimer)
+    stopTimer()
   })
 }
 
