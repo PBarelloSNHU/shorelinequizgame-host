@@ -6,7 +6,7 @@ import { ensureAnonymousSession } from './supabaseClient.js'
 const state = {
   isLoading: true,
   loadError: null,
-  session: null, // { status, joinCode, rosterCount, answeredCount, currentQuestionIndex, totalQuestions, scoreboardCount, question, scoreboard, timerSeconds, questionStartedAt }
+  session: null, // { status, joinCode, rosterCount, answeredCount, currentQuestionIndex, totalQuestions, question, scoreboard, timerSeconds, questionStartedAt }
 }
 
 const rootEl = document.getElementById('app')
@@ -14,6 +14,8 @@ let channel = null
 let resyncPromise = null
 let pollTimer = null
 let timerInterval = null
+let resyncFailureCount = 0
+const MAX_RESYNC_FAILURES = 3
 
 // ---------- Render ----------
 
@@ -60,7 +62,7 @@ function render() {
       break
     case 'ended':
       rootEl.innerHTML = renderScoreboard(state.session)
-      wireControl('#new-session-btn', null, startNewSession)
+      wireNewSession()
       stopTimer()
       break
     default:
@@ -192,20 +194,24 @@ function renderReveal(session) {
 }
 
 function renderScoreboard(session) {
-  const rows = (session.scoreboard ?? [])
-    .map(
-      (row, i) => `
-        <li>${i + 1}. ${escapeHtml(row.quiz_players?.display_name ?? row.player_id)} —
-          ${row.total_score} pts (${row.correct_count} correct)</li>
+  const sorted = [...(session.scoreboard ?? [])].sort((a, b) => b.total_score - a.total_score)
+
+  const rows = sorted
+    .map((row, i) => {
+      const name = escapeHtml(row.quiz_players?.display_name ?? row.player_id)
+      return `
+        <li>
+          ${i + 1}. ${name} — ${row.total_score} pts (${row.correct_count} correct)
+        </li>
       `
-    )
+    })
     .join('')
 
   return `
     ${renderHeader(session)}
     <section class="host-scoreboard">
       <h1>Final Scoreboard</h1>
-      <ol>${rows || '<li>No scores recorded.</li>'}</ol>
+      <ol class="scoreboard-list">${rows || '<li>No scores recorded.</li>'}</ol>
       <button id="new-session-btn">Start New Session</button>
     </section>
   `
@@ -263,11 +269,13 @@ function stopTimer() {
 
 function wireRetry() {
   document.getElementById('retry-btn')?.addEventListener('click', () => {
-    const sessionId = getSessionIdFromUrl()
-    if (sessionId) initHost(sessionId)
-    else {
+    if (getSessionIdFromUrl()) {
+      resyncFailureCount = 0
+      resyncHostState()
+    } else {
       state.isLoading = false
       state.loadError = null
+      state.session = null
       render()
     }
   })
@@ -279,19 +287,16 @@ function wireSetup() {
     btn.disabled = true
     const level = Number(document.getElementById('setup-level').value)
     const count = Number(document.getElementById('setup-count').value)
-    const timer = Number(document.getElementById('setup-timer').value)
+    const timerSeconds = Number(document.getElementById('setup-timer').value)
 
     try {
       await ensureAnonymousSession()
-      const { session_id } = await api.createSession({ level, count, timer })
-      const url = new URL(window.location.href)
-      url.searchParams.set('session', session_id)
-      window.history.replaceState({}, '', url)
-      initHost(session_id)
+      const result = await api.createSession({ level, count, timerSeconds })
+      setSessionIdInUrl(result.session_id)
+      await bootSession(result.session_id)
     } catch (err) {
       console.error('[host] failed to create session', err)
-      state.isLoading = false
-      state.loadError = `Failed to create session: ${err.message ?? 'unknown error'}`
+      state.loadError = err.message ?? 'Unable to create session. Please try again.'
       render()
     } finally {
       btn.disabled = false
@@ -299,51 +304,60 @@ function wireSetup() {
   })
 }
 
-function startNewSession() {
-  const url = new URL(window.location.href)
-  url.searchParams.delete('session')
-  url.searchParams.delete('code')
-  window.history.replaceState({}, '', url)
-  if (channel) {
-    channel.unsubscribe()
-    channel = null
-  }
-  if (pollTimer) {
-    clearInterval(pollTimer)
-    pollTimer = null
-  }
-  stopTimer()
-  state.isLoading = false
-  state.loadError = null
-  state.session = null
-  render()
-}
-
-function wireControl(selector, apiFn, customHandler) {
-  const el = document.querySelector(selector)
-  if (!el) return
-  el.addEventListener('click', async () => {
-    if (customHandler) return customHandler()
-    el.disabled = true
+function wireControl(selector, apiFn) {
+  document.querySelector(selector)?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget
+    btn.disabled = true
+    const sessionId = getSessionIdFromUrl()
     try {
-      await apiFn(getSessionIdFromUrl())
+      await apiFn(sessionId)
       await resyncHostState()
     } catch (err) {
-      console.error('[host] control action failed', err)
-      state.loadError = `Action failed: ${err.message ?? 'unknown error'}`
-      render()
+      console.error(`[host] action failed for ${selector}`, err)
     } finally {
-      el.disabled = false
+      btn.disabled = false
     }
   })
 }
 
-// ---------- Data resync ----------
+function wireNewSession() {
+  document.getElementById('new-session-btn')?.addEventListener('click', () => {
+    clearSessionIdFromUrl()
+    if (channel) {
+      channel.unsubscribe()
+      channel = null
+    }
+    if (pollTimer) {
+      clearInterval(pollTimer)
+      pollTimer = null
+    }
+    stopTimer()
+    state.isLoading = false
+    state.loadError = null
+    state.session = null
+    render()
+  })
+}
+
+// ---------- URL-based session id ----------
 
 function getSessionIdFromUrl() {
-  const params = new URL(window.location.href).searchParams
-  return params.get('session') || params.get('code') || null
+  return new URL(window.location.href).searchParams.get('session')
 }
+
+function setSessionIdInUrl(sessionId) {
+  const url = new URL(window.location.href)
+  url.searchParams.set('session', sessionId)
+  window.history.replaceState({}, '', url)
+}
+
+function clearSessionIdFromUrl() {
+  const url = new URL(window.location.href)
+  url.searchParams.delete('session')
+  window.history.replaceState({}, '', url)
+}
+
+// ---------- Data resync ----------
 
 async function resyncHostState() {
   const sessionId = getSessionIdFromUrl()
@@ -355,39 +369,69 @@ async function resyncHostState() {
       const rawSession = await api.fetchSession(sessionId)
       const roster = await api.fetchRoster(sessionId)
 
-      const next = {
+      const nextSession = {
         status: rawSession.status,
         joinCode: rawSession.join_code,
-        currentQuestionIndex: rawSession.current_question_index ?? 0,
-        totalQuestions: rawSession.question_count ?? 0,
         rosterCount: roster.length,
         answeredCount: 0,
-        scoreboardCount: 0,
-        question: null,
-        scoreboard: [],
+        currentQuestionIndex: rawSession.current_question_index ?? 0,
+        totalQuestions: rawSession.total_questions ?? 0,
         timerSeconds: rawSession.timer_seconds,
         questionStartedAt: rawSession.question_started_at,
+        question: null,
+        scoreboard: [],
       }
 
       if (rawSession.status === 'question_live') {
-        next.question = await api.fetchCurrentQuestion(sessionId)
-        next.answeredCount = await api.fetchAnsweredCount(sessionId, next.currentQuestionIndex)
+        const questionData = await api.fetchCurrentQuestionForHost(sessionId)
+        nextSession.question = questionData?.question ?? null
+        nextSession.answeredCount = questionData?.answeredCount ?? 0
       } else if (rawSession.status === 'reveal') {
-        next.question = await api.fetchRevealedQuestion(sessionId)
-        next.answeredCount = await api.fetchAnsweredCount(sessionId, next.currentQuestionIndex)
+        const questionData = await api.fetchRevealedQuestionForHost(sessionId)
+        nextSession.question = questionData?.question ?? null
+        nextSession.answeredCount = questionData?.answeredCount ?? 0
       } else if (rawSession.status === 'ended') {
-        next.scoreboard = await api.fetchScoreboard(sessionId)
-        next.scoreboardCount = next.scoreboard.length
+        nextSession.scoreboard = await api.fetchScoreboard(sessionId)
+      }
+
+      state.session = nextSession
+      state.isLoading = false
+      state.loadError = null
+      resyncFailureCount = 0
+    } catch (err) {
+      console.error('[host] failed to load session state', err)
+      resyncFailureCount += 1
+
+      if (resyncFailureCount >= MAX_RESYNC_FAILURES) {
+        console.warn('[host] giving up on broken session, clearing session id')
+        clearSessionIdFromUrl()
+        if (channel) {
+          channel.unsubscribe()
+          channel = null
+        }
+        if (pollTimer) {
+          clearInterval(pollTimer)
+          pollTimer = null
+        }
+        stopTimer()
+        state.isLoading = false
+        state.loadError = null
+        state.session = null
+        render()
+        return
       }
 
       state.isLoading = false
-      state.loadError = null
-      state.session = next
-    } catch (err) {
-      console.error('[host] failed to resync host state', err)
-      state.isLoading = false
-      state.loadError = `Unable to load session: ${err.message ?? 'it may have ended or the code is invalid'}`
+      state.loadError = null // keep last known view rather than hard error, unless failures exceed threshold
     }
+
+    console.log('[host] resynced host state:', {
+      status: state.session?.status,
+      rosterCount: state.session?.rosterCount,
+      answeredCount: state.session?.answeredCount,
+      currentQuestionIndex: state.session?.currentQuestionIndex,
+      resyncFailureCount,
+    })
 
     render()
   })()
@@ -401,10 +445,9 @@ async function resyncHostState() {
 
 // ---------- Boot ----------
 
-async function initHost(sessionId) {
+async function bootSession(sessionId) {
   state.isLoading = true
   state.loadError = null
-  state.session = null
   render()
 
   if (channel) {
@@ -417,27 +460,22 @@ async function initHost(sessionId) {
   }
   stopTimer()
 
-  try {
-    await ensureAnonymousSession()
-  } catch (err) {
-    console.error('[host] anonymous auth failed', err)
-    state.isLoading = false
-    state.loadError = 'Unable to authenticate. Please refresh and try again.'
-    render()
-    return
-  }
-
   await resyncHostState()
 
   channel = joinSessionChannel(sessionId, {
     presenceKey: 'host',
+    presencePayload: { role: 'host' },
     onChange: () => {
       resyncHostState()
     },
-    onPresenceSync: () => {},
+    onPresenceSync: (presenceState) => {
+      if (state.session) {
+        state.session.rosterCount = Object.keys(presenceState).length || state.session.rosterCount
+        if (state.session.status === 'lobby') render()
+      }
+    },
   })
 
-  // Safety-net poll in case a broadcast is missed (e.g. brief disconnect).
   pollTimer = setInterval(() => {
     api.tryAdvanceIfExpired(sessionId).catch(() => {})
     resyncHostState()
@@ -450,18 +488,30 @@ async function initHost(sessionId) {
   })
 }
 
-const initialSessionId = getSessionIdFromUrl()
-if (initialSessionId) {
-  initHost(initialSessionId)
-} else {
-  ensureAnonymousSession()
-    .catch((err) => console.error('[host] anonymous auth failed on boot', err))
-    .finally(() => {
-      state.isLoading = false
-      state.loadError = null
-      state.session = null
-      render()
-    })
+async function boot() {
+  const sessionId = getSessionIdFromUrl()
+
+  if (!sessionId) {
+    state.isLoading = false
+    state.loadError = null
+    state.session = null
+    render()
+    return
+  }
+
+  try {
+    await ensureAnonymousSession()
+    await bootSession(sessionId)
+  } catch (err) {
+    console.error('[host] failed to resume session', err)
+    clearSessionIdFromUrl()
+    state.isLoading = false
+    state.loadError = null
+    state.session = null
+    render()
+  }
 }
 
-export { initHost, render, state }
+boot()
+
+export { render, state }
